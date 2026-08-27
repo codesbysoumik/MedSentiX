@@ -71,18 +71,28 @@ def get_amp_dtype(device: torch.device) -> torch.dtype:
 
     bf16 tensor cores require Ampere (SM80) or newer — e.g. your local RTX
     5070 Ti (Blackwell). Kaggle's T4 (Turing, SM75) has no bf16 tensor core
-    support, so autocast(bfloat16) on a T4 silently falls back to slow,
-    unaccelerated math instead of erroring — it just looks like the
-    optimization "stopped working." T4 does have fast fp16 tensor cores, so
-    we fall back to fp16 there. fp16 needs loss scaling (see
-    torch.cuda.amp.GradScaler) since its exponent range is much narrower
-    than bf16's — bf16 doesn't need a scaler at all.
+    support. Newer PyTorch's is_bf16_supported() defaults to counting
+    *software-emulated* bf16 as "supported" (via its including_emulation
+    flag), which returns True even on a T4 — so calling it without that
+    flag silently picks the slow, unaccelerated path instead of erroring.
+    We explicitly ask for hardware-accelerated support only, falling back
+    to the plain call on older PyTorch versions that don't have the
+    parameter at all.
+
+    T4 does have fast fp16 tensor cores, so we fall back to fp16 there.
+    fp16 needs loss scaling (see torch.cuda.amp.GradScaler) since its
+    exponent range is much narrower than bf16's — bf16 doesn't need a
+    scaler at all.
     """
     if device.type != "cuda":
         return torch.float32
-    if torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    return torch.float16
+    try:
+        bf16_ok = torch.cuda.is_bf16_supported(including_emulation=False)
+    except TypeError:
+        # Older PyTorch — no including_emulation parameter, plain call only
+        # checks hardware capability already.
+        bf16_ok = torch.cuda.is_bf16_supported()
+    return torch.bfloat16 if bf16_ok else torch.float16
 
 
 __all__ = ["RANDOM_SEED", "get_device", "set_seed", "default_num_workers", "get_amp_dtype"]
