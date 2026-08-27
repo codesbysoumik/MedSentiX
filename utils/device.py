@@ -66,4 +66,23 @@ def default_num_workers(cap: int = 4) -> int:
     return max(0, min(cap, cpu_count - 1))
 
 
-__all__ = ["RANDOM_SEED", "get_device", "set_seed", "default_num_workers"]
+def get_amp_dtype(device: torch.device) -> torch.dtype:
+    """Pick the mixed-precision dtype the current GPU can actually accelerate.
+
+    bf16 tensor cores require Ampere (SM80) or newer — e.g. your local RTX
+    5070 Ti (Blackwell). Kaggle's T4 (Turing, SM75) has no bf16 tensor core
+    support, so autocast(bfloat16) on a T4 silently falls back to slow,
+    unaccelerated math instead of erroring — it just looks like the
+    optimization "stopped working." T4 does have fast fp16 tensor cores, so
+    we fall back to fp16 there. fp16 needs loss scaling (see
+    torch.cuda.amp.GradScaler) since its exponent range is much narrower
+    than bf16's — bf16 doesn't need a scaler at all.
+    """
+    if device.type != "cuda":
+        return torch.float32
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+__all__ = ["RANDOM_SEED", "get_device", "set_seed", "default_num_workers", "get_amp_dtype"]
