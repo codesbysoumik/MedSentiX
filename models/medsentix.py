@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from functools import partial
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -20,6 +21,7 @@ import seaborn as sns
 import torch
 from sklearn.metrics import accuracy_score, f1_score
 from torch import nn
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
@@ -45,14 +47,14 @@ from models.baselines import (
     save_confusion_matrix,
     save_training_curve,
 )
-from utils.device import RANDOM_SEED, get_device, set_seed
+from utils.device import RANDOM_SEED, default_num_workers, get_device, set_seed
 from utils.memory import cleanup_memory
 
 
 # Training constants are kept identical to the specification.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BIOBERT_MODEL_NAME = "dmis-lab/biobert-base-cased-v1.2"
-BATCH_SIZE = 16
+BATCH_SIZE = 20
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 EPOCHS = 10
@@ -232,10 +234,12 @@ class MedSentiXDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         row = self.frame.iloc[index]
+        # No fixed-length padding here — see medsentix_collate. Most reviews
+        # are far shorter than MAX_LEN, so per-sample padding to 512 was
+        # wasting the bulk of every forward/backward pass on PAD tokens.
         encoded = self.tokenizer(
             str(row["review"]),
             truncation=True,
-            padding="max_length",
             max_length=self.max_len,
             return_tensors="pt",
         )
@@ -247,6 +251,17 @@ class MedSentiXDataset(Dataset):
         for column in ASPECT_COLUMNS:
             item[column] = torch.tensor(int(row.get(column, MISSING_ASPECT_LABEL)), dtype=torch.long)
         return item
+
+
+def medsentix_collate(batch: List[Dict[str, torch.Tensor]], pad_id: int = 0) -> Dict[str, torch.Tensor]:
+    """Pad each batch to its own longest sequence instead of MAX_LEN (512)."""
+    input_ids = pad_sequence([b["input_ids"] for b in batch], batch_first=True, padding_value=pad_id)
+    attention_mask = pad_sequence([b["attention_mask"] for b in batch], batch_first=True, padding_value=0)
+    labels = torch.stack([b["labels"] for b in batch])
+    out = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+    for column in ASPECT_COLUMNS:
+        out[column] = torch.stack([b[column] for b in batch])
+    return out
 
 
 def _coerce_aspect_column(frame: pd.DataFrame, column: str) -> pd.Series:
@@ -302,9 +317,13 @@ def make_medsentix_loaders(
     if AutoTokenizer is None:
         raise ImportError("transformers is required for MedSentiX dataloaders.")
     tokenizer = AutoTokenizer.from_pretrained(BIOBERT_MODEL_NAME)
-    train_loader = DataLoader(MedSentiXDataset(train_df, tokenizer), batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(MedSentiXDataset(val_df, tokenizer), batch_size=batch_size)
-    test_loader = DataLoader(MedSentiXDataset(test_df, tokenizer), batch_size=batch_size)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    collate = partial(medsentix_collate, pad_id=pad_id)
+    workers = default_num_workers(4)
+    common = dict(num_workers=workers, pin_memory=True, persistent_workers=(workers > 0))
+    train_loader = DataLoader(MedSentiXDataset(train_df, tokenizer), batch_size=batch_size, shuffle=True, collate_fn=collate, **common)
+    val_loader = DataLoader(MedSentiXDataset(val_df, tokenizer), batch_size=batch_size, collate_fn=collate, **common)
+    test_loader = DataLoader(MedSentiXDataset(test_df, tokenizer), batch_size=batch_size, collate_fn=collate, **common)
     return train_loader, val_loader, test_loader, tokenizer
 
 
@@ -343,9 +362,10 @@ def evaluate_medsentix(model: MedSentiX, loader: DataLoader, device: torch.devic
     start = time.perf_counter()
     with torch.inference_mode():
         for batch in loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            logits, _, _ = model(input_ids=input_ids, attention_mask=attention_mask)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                logits, _, _ = model(input_ids=input_ids, attention_mask=attention_mask)
             probs = torch.softmax(logits, dim=-1)
             probabilities.extend(probs.detach().cpu().numpy())
             predictions.extend(torch.argmax(probs, dim=1).detach().cpu().tolist())
@@ -416,11 +436,12 @@ def train_medsentix_variant(
         losses: List[float] = []
         for batch in tqdm(train_loader, desc=f"MedSentiX-{variant} epoch {epoch + 1}/{epochs}"):
             optimizer.zero_grad(set_to_none=True)
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-            logits, _, auxiliary_logits = model(input_ids=input_ids, attention_mask=attention_mask)
-            loss, _ = compute_medsentix_loss(logits, labels, auxiliary_logits, batch, criterion, effective_lambda)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                logits, _, auxiliary_logits = model(input_ids=input_ids, attention_mask=attention_mask)
+                loss, _ = compute_medsentix_loss(logits, labels, auxiliary_logits, batch, criterion, effective_lambda)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP)
             optimizer.step()
@@ -510,7 +531,14 @@ def cross_dataset_generalization(
         if dev_mode:
             frame = frame.head(sample_size)
         standardized = standardize_frame(frame, dataset_name)
-        loader = DataLoader(MedSentiXDataset(standardized, tokenizer), batch_size=BATCH_SIZE)
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        loader = DataLoader(
+            MedSentiXDataset(standardized, tokenizer),
+            batch_size=BATCH_SIZE,
+            collate_fn=partial(medsentix_collate, pad_id=pad_id),
+            num_workers=default_num_workers(2),
+            pin_memory=True,
+        )
         metrics, labels, predictions, probabilities = evaluate_medsentix(model, loader, device)
         accuracies.append(float(metrics["accuracy"]))
         del loader, standardized, frame, metrics, labels, predictions, probabilities
@@ -609,7 +637,14 @@ def validate_absa_on_druglib(
     if dev_mode:
         frame = frame.head(sample_size)
     dataset = MedSentiXDataset(standardize_frame(frame, "druglib"), tokenizer)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    loader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        collate_fn=partial(medsentix_collate, pad_id=pad_id),
+        num_workers=default_num_workers(2),
+        pin_memory=True,
+    )
     rows = []
     for variant in variants:
         checkpoint_path = project_root / f"checkpoints/medsentix/medsentix_{variant}.pt"
