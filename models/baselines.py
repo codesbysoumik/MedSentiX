@@ -11,6 +11,7 @@ import json
 import math
 import re
 import time
+from functools import partial
 from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -34,6 +35,7 @@ from sklearn.metrics import (
 from sklearn.pipeline import Pipeline
 from sklearn.svm import LinearSVC
 from torch import nn
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
@@ -44,7 +46,7 @@ except Exception:  # pragma: no cover - notebooks surface dependency errors clea
     AutoTokenizer = None
     get_linear_schedule_with_warmup = None
 
-from utils.device import RANDOM_SEED, get_device, set_seed
+from utils.device import RANDOM_SEED, default_num_workers, get_device, set_seed
 from utils.memory import cleanup_memory
 
 
@@ -56,8 +58,9 @@ NUM_CLASSES = 3
 GLOVE_DIM = 100
 GLOVE_MAX_LEN = 256
 TRANSFORMER_MAX_LEN = 512
-BATCH_SIZE = 16
+BATCH_SIZE = 24
 EPOCHS = 10
+EARLY_STOPPING_PATIENCE = 3
 DROPOUT = 0.3
 CLASS_WEIGHTS = torch.tensor([1.5, 2.0, 1.0], dtype=torch.float)
 
@@ -199,17 +202,24 @@ class GloveReviewDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        # Truncated but NOT padded here — padding happens per-batch in
+        # glove_collate so short reviews don't pay for GLOVE_MAX_LEN-length
+        # compute. Numerically identical to fixed padding, just faster.
         tokens = simple_tokenize(self.texts[index])[: self.max_len]
-        ids = [self.vocab.get(token, self.vocab["<UNK>"]) for token in tokens]
-        mask = [1] * len(ids)
-        padding = self.max_len - len(ids)
-        ids.extend([self.vocab["<PAD>"]] * padding)
-        mask.extend([0] * padding)
+        ids = [self.vocab.get(token, self.vocab["<UNK>"]) for token in tokens] or [self.vocab["<PAD>"]]
         return {
             "input_ids": torch.tensor(ids, dtype=torch.long),
-            "attention_mask": torch.tensor(mask, dtype=torch.float),
+            "attention_mask": torch.tensor([1] * len(ids), dtype=torch.float),
             "labels": torch.tensor(self.labels[index], dtype=torch.long),
         }
+
+
+def glove_collate(batch: List[Dict[str, torch.Tensor]], pad_id: int = 0) -> Dict[str, torch.Tensor]:
+    """Pad each batch to its own longest sequence instead of a fixed max length."""
+    input_ids = pad_sequence([b["input_ids"] for b in batch], batch_first=True, padding_value=pad_id)
+    attention_mask = pad_sequence([b["attention_mask"] for b in batch], batch_first=True, padding_value=0.0)
+    labels = torch.stack([b["labels"] for b in batch])
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
 class TransformerReviewDataset(Dataset):
@@ -225,10 +235,12 @@ class TransformerReviewDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        # No fixed-length padding here — see transformer_collate. Reviews are
+        # rarely near TRANSFORMER_MAX_LEN tokens, so per-sample max_length
+        # padding was burning most of the compute on PAD tokens.
         encoded = self.tokenizer(
             str(self.texts[index]),
             truncation=True,
-            padding="max_length",
             max_length=self.max_len,
             return_tensors="pt",
         )
@@ -237,6 +249,14 @@ class TransformerReviewDataset(Dataset):
             "attention_mask": encoded["attention_mask"].squeeze(0),
             "labels": torch.tensor(self.labels[index], dtype=torch.long),
         }
+
+
+def transformer_collate(batch: List[Dict[str, torch.Tensor]], pad_id: int = 0) -> Dict[str, torch.Tensor]:
+    """Pad each batch to its own longest sequence instead of TRANSFORMER_MAX_LEN."""
+    input_ids = pad_sequence([b["input_ids"] for b in batch], batch_first=True, padding_value=pad_id)
+    attention_mask = pad_sequence([b["attention_mask"] for b in batch], batch_first=True, padding_value=0)
+    labels = torch.stack([b["labels"] for b in batch])
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
 def masked_mean(sequence: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -373,9 +393,10 @@ def evaluate_neural_model(model: nn.Module, loader: DataLoader, device: torch.de
     start = time.perf_counter()
     with torch.inference_mode():
         for batch in loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            logits = model(input_ids=input_ids, attention_mask=attention_mask)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                logits = model(input_ids=input_ids, attention_mask=attention_mask)
             predictions.extend(torch.argmax(logits, dim=1).detach().cpu().tolist())
             labels.extend(batch["labels"].detach().cpu().tolist())
     elapsed = time.perf_counter() - start
@@ -415,6 +436,7 @@ def train_neural_classifier(
         )
 
     best_val_accuracy = -1.0
+    epochs_without_improvement = 0
     history = {"train_loss": [], "val_accuracy": []}
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     batch = input_ids = attention_mask = labels = loss = None
@@ -424,10 +446,11 @@ def train_neural_classifier(
         losses: List[float] = []
         for batch in tqdm(train_loader, desc=f"{model_name} epoch {epoch + 1}/{epochs}"):
             optimizer.zero_grad(set_to_none=True)
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-            loss = criterion(model(input_ids=input_ids, attention_mask=attention_mask), labels)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                loss = criterion(model(input_ids=input_ids, attention_mask=attention_mask), labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -440,7 +463,12 @@ def train_neural_classifier(
         history["val_accuracy"].append(float(val_metrics["accuracy"]))
         if val_metrics["accuracy"] > best_val_accuracy:
             best_val_accuracy = val_metrics["accuracy"]
+            epochs_without_improvement = 0
             torch.save(model.state_dict(), checkpoint_path)
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+                break
 
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     test_metrics, y_true, y_pred = evaluate_neural_model(model, test_loader, device)
@@ -468,10 +496,14 @@ def make_glove_loaders(
     train_ds = GloveReviewDataset(train_df["review"], train_df["label"].astype(int), vocab)
     val_ds = GloveReviewDataset(val_df["review"], val_df["label"].astype(int), vocab)
     test_ds = GloveReviewDataset(test_df["review"], test_df["label"].astype(int), vocab)
+    pad_id = vocab["<PAD>"]
+    collate = partial(glove_collate, pad_id=pad_id)
+    workers = default_num_workers(4)
+    common = dict(num_workers=workers, pin_memory=True, persistent_workers=(workers > 0))
     return (
-        DataLoader(train_ds, batch_size=batch_size, shuffle=True),
-        DataLoader(val_ds, batch_size=batch_size),
-        DataLoader(test_ds, batch_size=batch_size),
+        DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate, **common),
+        DataLoader(val_ds, batch_size=batch_size, collate_fn=collate, **common),
+        DataLoader(test_ds, batch_size=batch_size, collate_fn=collate, **common),
         embeddings,
     )
 
@@ -490,10 +522,14 @@ def make_transformer_loaders(
     train_ds = TransformerReviewDataset(train_df["review"], train_df["label"].astype(int), tokenizer)
     val_ds = TransformerReviewDataset(val_df["review"], val_df["label"].astype(int), tokenizer)
     test_ds = TransformerReviewDataset(test_df["review"], test_df["label"].astype(int), tokenizer)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    collate = partial(transformer_collate, pad_id=pad_id)
+    workers = default_num_workers(4)
+    common = dict(num_workers=workers, pin_memory=True, persistent_workers=(workers > 0))
     return (
-        DataLoader(train_ds, batch_size=batch_size, shuffle=True),
-        DataLoader(val_ds, batch_size=batch_size),
-        DataLoader(test_ds, batch_size=batch_size),
+        DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate, **common),
+        DataLoader(val_ds, batch_size=batch_size, collate_fn=collate, **common),
+        DataLoader(test_ds, batch_size=batch_size, collate_fn=collate, **common),
     )
 
 
@@ -509,7 +545,13 @@ def train_all_baselines(
     results: List[Dict[str, float]] = []
     checkpoints = project_root / "checkpoints/baselines"
 
+    results_path = project_root / "results/tables/baseline_results.csv"
+
+    def _flush() -> None:
+        pd.DataFrame(results).to_csv(results_path, index=False)
+
     results.append(train_svm_baseline(train_df, test_df, checkpoints / "svm.pkl", project_root=project_root))
+    _flush()
     cleanup_memory()
 
     glove_train, glove_val, glove_test, embeddings = make_glove_loaders(train_df, val_df, test_df, project_root=project_root)
@@ -526,6 +568,7 @@ def train_all_baselines(
                     model, glove_train, glove_val, glove_test, checkpoints / f"{name}.pt", name, lr=1e-3, epochs=epochs
                 )
             )
+            _flush()
         finally:
             del model
             cleanup_memory()
@@ -554,10 +597,11 @@ def train_all_baselines(
                     epochs=epochs,
                 )
             )
+            _flush()
         finally:
             del model, train_loader, val_loader, test_loader
             cleanup_memory()
 
     result_df = pd.DataFrame(results)
-    result_df.to_csv(project_root / "results/tables/baseline_results.csv", index=False)
+    _flush()
     return result_df
