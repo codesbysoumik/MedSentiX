@@ -47,7 +47,7 @@ from models.baselines import (
     save_confusion_matrix,
     save_training_curve,
 )
-from utils.device import RANDOM_SEED, default_num_workers, get_device, set_seed
+from utils.device import RANDOM_SEED, default_num_workers, get_amp_dtype, get_device, set_seed
 from utils.memory import cleanup_memory
 
 
@@ -359,12 +359,13 @@ def evaluate_medsentix(model: MedSentiX, loader: DataLoader, device: torch.devic
     predictions: List[int] = []
     probabilities: List[np.ndarray] = []
     batch = input_ids = attention_mask = logits = probs = None
+    amp_dtype = get_amp_dtype(device)
     start = time.perf_counter()
     with torch.inference_mode():
         for batch in loader:
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
                 logits, _, _ = model(input_ids=input_ids, attention_mask=attention_mask)
             probs = torch.softmax(logits, dim=-1)
             probabilities.extend(probs.detach().cpu().numpy())
@@ -431,26 +432,54 @@ def train_medsentix_variant(
     epochs_without_improvement = 0
     batch = input_ids = attention_mask = labels = logits = auxiliary_logits = loss = None
 
+    amp_dtype = get_amp_dtype(device)
+    use_scaler = amp_dtype == torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+
     for epoch in range(epochs):
         model.train()
         losses: List[float] = []
-        for batch in tqdm(train_loader, desc=f"MedSentiX-{variant} epoch {epoch + 1}/{epochs}"):
+        total_batches = len(train_loader)
+        log_every = max(1, total_batches // 10)  # ~10 plain-text checkpoints per epoch
+        for step, batch in enumerate(tqdm(train_loader, desc=f"MedSentiX-{variant} epoch {epoch + 1}/{epochs}"), start=1):
             optimizer.zero_grad(set_to_none=True)
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
                 logits, _, auxiliary_logits = model(input_ids=input_ids, attention_mask=attention_mask)
                 loss, _ = compute_medsentix_loss(logits, labels, auxiliary_logits, batch, criterion, effective_lambda)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP)
-            optimizer.step()
+            if use_scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP)
+                optimizer.step()
             scheduler.step()
             losses.append(float(loss.detach().cpu()))
+            # Plain print(), not tqdm's \r-based update — Kaggle's log
+            # viewer/exporter (especially in background/commit mode) doesn't
+            # reliably capture carriage-return overwrites, so without this a
+            # long run can look completely silent even while it's healthy.
+            if step % log_every == 0 or step == total_batches:
+                print(
+                    f"[MedSentiX-{variant}] epoch {epoch + 1}/{epochs} "
+                    f"step {step}/{total_batches} loss={float(np.mean(losses[-log_every:])):.4f}",
+                    flush=True,
+                )
 
         val_metrics, _, _, _ = evaluate_medsentix(model, val_loader, device)
         history["train_loss"].append(float(np.mean(losses)))
         history["val_accuracy"].append(float(val_metrics["accuracy"]))
+        print(
+            f"[MedSentiX-{variant}] epoch {epoch + 1}/{epochs} done — "
+            f"train_loss={history['train_loss'][-1]:.4f} val_accuracy={val_metrics['accuracy']:.4f}",
+            flush=True,
+        )
         if val_metrics["accuracy"] > best_val_accuracy:
             best_val_accuracy = val_metrics["accuracy"]
             epochs_without_improvement = 0
@@ -458,6 +487,7 @@ def train_medsentix_variant(
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+                print(f"[MedSentiX-{variant}] early stopping at epoch {epoch + 1} (patience={EARLY_STOPPING_PATIENCE})", flush=True)
                 break
 
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))

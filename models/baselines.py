@@ -46,7 +46,7 @@ except Exception:  # pragma: no cover - notebooks surface dependency errors clea
     AutoTokenizer = None
     get_linear_schedule_with_warmup = None
 
-from utils.device import RANDOM_SEED, default_num_workers, get_device, set_seed
+from utils.device import RANDOM_SEED, default_num_workers, get_amp_dtype, get_device, set_seed
 from utils.memory import cleanup_memory
 
 
@@ -390,12 +390,13 @@ def evaluate_neural_model(model: nn.Module, loader: DataLoader, device: torch.de
     labels: List[int] = []
     predictions: List[int] = []
     batch = input_ids = attention_mask = logits = None
+    amp_dtype = get_amp_dtype(device)
     start = time.perf_counter()
     with torch.inference_mode():
         for batch in loader:
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
                 logits = model(input_ids=input_ids, attention_mask=attention_mask)
             predictions.extend(torch.argmax(logits, dim=1).detach().cpu().tolist())
             labels.extend(batch["labels"].detach().cpu().tolist())
@@ -435,6 +436,14 @@ def train_neural_classifier(
             num_training_steps=total_steps,
         )
 
+    amp_dtype = get_amp_dtype(device)
+    # fp16 (used on Turing GPUs like Kaggle's T4, which lack bf16 tensor
+    # cores) has a narrow exponent range and can underflow small gradients,
+    # so it needs loss scaling. bf16 matches fp32's exponent range and
+    # doesn't — the scaler is a no-op passthrough in that case.
+    use_scaler = amp_dtype == torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+
     best_val_accuracy = -1.0
     epochs_without_improvement = 0
     history = {"train_loss": [], "val_accuracy": []}
@@ -444,23 +453,45 @@ def train_neural_classifier(
     for epoch in range(epochs):
         model.train()
         losses: List[float] = []
-        for batch in tqdm(train_loader, desc=f"{model_name} epoch {epoch + 1}/{epochs}"):
+        total_batches = len(train_loader)
+        log_every = max(1, total_batches // 10)
+        for step, batch in enumerate(tqdm(train_loader, desc=f"{model_name} epoch {epoch + 1}/{epochs}"), start=1):
             optimizer.zero_grad(set_to_none=True)
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
                 loss = criterion(model(input_ids=input_ids, attention_mask=attention_mask), labels)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            if use_scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
             if scheduler is not None:
                 scheduler.step()
             losses.append(float(loss.detach().cpu()))
+            # Plain print(), not tqdm's \r — see medsentix.py for why this
+            # matters on Kaggle's background/commit log export.
+            if step % log_every == 0 or step == total_batches:
+                print(
+                    f"[{model_name}] epoch {epoch + 1}/{epochs} step {step}/{total_batches} "
+                    f"loss={float(np.mean(losses[-log_every:])):.4f}",
+                    flush=True,
+                )
 
         val_metrics, _, _ = evaluate_neural_model(model, val_loader, device)
         history["train_loss"].append(float(np.mean(losses)))
         history["val_accuracy"].append(float(val_metrics["accuracy"]))
+        print(
+            f"[{model_name}] epoch {epoch + 1}/{epochs} done — "
+            f"train_loss={history['train_loss'][-1]:.4f} val_accuracy={val_metrics['accuracy']:.4f}",
+            flush=True,
+        )
         if val_metrics["accuracy"] > best_val_accuracy:
             best_val_accuracy = val_metrics["accuracy"]
             epochs_without_improvement = 0
@@ -468,6 +499,7 @@ def train_neural_classifier(
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+                print(f"[{model_name}] early stopping at epoch {epoch + 1} (patience={EARLY_STOPPING_PATIENCE})", flush=True)
                 break
 
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
@@ -478,7 +510,7 @@ def train_neural_classifier(
         json.dump(history, handle, indent=2)
     # The caller owns the model and loaders. Release only objects local to this
     # completed training run before it advances to the next baseline.
-    del optimizer, scheduler, criterion, batch, input_ids, attention_mask, labels, loss
+    del optimizer, scheduler, criterion, scaler, batch, input_ids, attention_mask, labels, loss
     cleanup_memory()
     return {"model": model_name, **test_metrics}
 
