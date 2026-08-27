@@ -442,7 +442,7 @@ def train_neural_classifier(
     # so it needs loss scaling. bf16 matches fp32's exponent range and
     # doesn't — the scaler is a no-op passthrough in that case.
     use_scaler = amp_dtype == torch.float16
-    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
     best_val_accuracy = -1.0
     epochs_without_improvement = 0

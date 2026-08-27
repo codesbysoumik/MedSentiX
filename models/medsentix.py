@@ -367,6 +367,12 @@ def evaluate_medsentix(model: MedSentiX, loader: DataLoader, device: torch.devic
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
                 logits, _, _ = model(input_ids=input_ids, attention_mask=attention_mask)
+            # NumPy has no native bfloat16 dtype — .numpy() below throws
+            # "unsupported ScalarType BFloat16" unless we cast back to fp32
+            # first. This also protects fp16 runs from any similar future
+            # downstream numpy call, at negligible cost since we're in
+            # inference_mode already.
+            logits = logits.float()
             probs = torch.softmax(logits, dim=-1)
             probabilities.extend(probs.detach().cpu().numpy())
             predictions.extend(torch.argmax(probs, dim=1).detach().cpu().tolist())
@@ -434,7 +440,7 @@ def train_medsentix_variant(
 
     amp_dtype = get_amp_dtype(device)
     use_scaler = amp_dtype == torch.float16
-    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
     for epoch in range(epochs):
         model.train()
