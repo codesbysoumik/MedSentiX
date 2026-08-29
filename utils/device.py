@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import platform
 import random
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -95,4 +96,16 @@ def get_amp_dtype(device: torch.device) -> torch.dtype:
     return torch.bfloat16 if bf16_ok else torch.float16
 
 
-__all__ = ["RANDOM_SEED", "get_device", "set_seed", "default_num_workers", "get_amp_dtype"]
+def running_on_kaggle() -> bool:
+    """True when executing inside a Kaggle notebook session.
+
+    Used to gate the extra plain-text progress prints in the training
+    loops: Kaggle's background/commit log export doesn't reliably capture
+    tqdm's carriage-return progress updates, so those loops print explicit
+    lines there. Locally (VS Code, JupyterLab, etc.) tqdm already renders
+    live, so the extra prints are just redundant clutter — skip them there.
+    """
+    return "KAGGLE_KERNEL_RUN_TYPE" in os.environ or Path("/kaggle").exists()
+
+
+__all__ = ["RANDOM_SEED", "get_device", "set_seed", "default_num_workers", "get_amp_dtype", "running_on_kaggle"]
