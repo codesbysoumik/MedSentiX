@@ -46,7 +46,7 @@ except Exception:  # pragma: no cover - notebooks surface dependency errors clea
     AutoTokenizer = None
     get_linear_schedule_with_warmup = None
 
-from utils.device import RANDOM_SEED, default_num_workers, get_amp_dtype, get_device, set_seed
+from utils.device import RANDOM_SEED, default_num_workers, get_amp_dtype, get_device, running_on_kaggle, set_seed
 from utils.memory import cleanup_memory
 
 
@@ -452,8 +452,10 @@ def train_neural_classifier(
 
     for epoch in range(epochs):
         model.train()
-        losses: List[float] = []
+        loss_sum = torch.zeros((), device=device)  # stays on GPU — no per-step sync
+        batch_count = 0
         total_batches = len(train_loader)
+        verbose = running_on_kaggle()  # tqdm renders live locally; Kaggle's log export doesn't capture it
         log_every = max(1, total_batches // 10)
         for step, batch in enumerate(tqdm(train_loader, desc=f"{model_name} epoch {epoch + 1}/{epochs}"), start=1):
             optimizer.zero_grad(set_to_none=True)
@@ -474,18 +476,22 @@ def train_neural_classifier(
                 optimizer.step()
             if scheduler is not None:
                 scheduler.step()
-            losses.append(float(loss.detach().cpu()))
-            # Plain print(), not tqdm's \r — see medsentix.py for why this
-            # matters on Kaggle's background/commit log export.
-            if step % log_every == 0 or step == total_batches:
+            # Accumulate on-device — avoids the per-step CPU/GPU sync that
+            # float(loss.cpu()) forces, which was stalling the pipeline
+            # between batches and showing up as GPU utilization dips.
+            loss_sum += loss.detach()
+            batch_count += 1
+            if verbose and (step % log_every == 0 or step == total_batches):
+                recent_avg = (loss_sum / batch_count).item()  # one sync per ~10% of epoch, not per step
                 print(
                     f"[{model_name}] epoch {epoch + 1}/{epochs} step {step}/{total_batches} "
-                    f"loss={float(np.mean(losses[-log_every:])):.4f}",
+                    f"loss={recent_avg:.4f}",
                     flush=True,
                 )
 
+        epoch_train_loss = (loss_sum / max(batch_count, 1)).item()
         val_metrics, _, _ = evaluate_neural_model(model, val_loader, device)
-        history["train_loss"].append(float(np.mean(losses)))
+        history["train_loss"].append(epoch_train_loss)
         history["val_accuracy"].append(float(val_metrics["accuracy"]))
         print(
             f"[{model_name}] epoch {epoch + 1}/{epochs} done — "

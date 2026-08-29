@@ -47,7 +47,7 @@ from models.baselines import (
     save_confusion_matrix,
     save_training_curve,
 )
-from utils.device import RANDOM_SEED, default_num_workers, get_amp_dtype, get_device, set_seed
+from utils.device import RANDOM_SEED, default_num_workers, get_amp_dtype, get_device, running_on_kaggle, set_seed
 from utils.memory import cleanup_memory
 
 
@@ -413,15 +413,25 @@ def train_medsentix_variant(
     use_auxiliary_heads: bool = True,
     checkpoint_name: Optional[str] = None,
     save_variant_results: bool = True,
+    device_override: Optional[str] = None,
 ) -> Tuple[MedSentiX, pd.DataFrame, Dict[str, List[float]]]:
-    """Train one MedSentiX variant and save its checkpoint and result row."""
+    """Train one MedSentiX variant and save its checkpoint and result row.
+
+    device_override pins this run to a specific GPU (e.g. "cuda:1") instead
+    of always using get_device()'s default (cuda:0). Useful for running two
+    independent variants concurrently on a dual-GPU instance — each process
+    targets a different physical GPU, so they don't contend for the same
+    device.
+    """
     set_seed(RANDOM_SEED)
     ensure_medsentix_dirs(project_root)
     effective_lambda = 0.0 if variant == "D" else (LAMBDA_ASPECT if lambda_aspect is None else lambda_aspect)
     train_df, val_df, test_df = load_variant_splits(variant, project_root, dev_mode, sample_size)
     train_loader, val_loader, test_loader, tokenizer = make_medsentix_loaders(train_df, val_df, test_df)
 
-    device = get_device()
+    device = torch.device(device_override) if device_override else get_device()
+    if device_override:
+        print(f"[MedSentiX-{variant}] pinned to device: {device}", flush=True)
     model = MedSentiX(use_bilstm=use_bilstm, use_attention=use_attention, use_auxiliary_heads=use_auxiliary_heads).to(device)
     criterion = nn.CrossEntropyLoss(weight=CLASS_WEIGHTS.to(device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -433,19 +443,44 @@ def train_medsentix_variant(
     )
     checkpoint_stem = checkpoint_name or f"medsentix_{variant}"
     checkpoint_path = project_root / f"checkpoints/medsentix/{checkpoint_stem}.pt"
+    # Separate from checkpoint_path (which only holds the *best* val-accuracy
+    # weights): this one is overwritten every epoch regardless of whether it
+    # improved, so a session reset can resume from the last completed epoch
+    # instead of losing everything since the last improvement.
+    resume_path = project_root / f"checkpoints/medsentix/{checkpoint_stem}.resume.pt"
     history = {"train_loss": [], "val_accuracy": []}
     best_val_accuracy = -1.0
     epochs_without_improvement = 0
+    start_epoch = 0
     batch = input_ids = attention_mask = labels = logits = auxiliary_logits = loss = None
 
     amp_dtype = get_amp_dtype(device)
     use_scaler = amp_dtype == torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
-    for epoch in range(epochs):
+    if resume_path.exists():
+        state = torch.load(resume_path, map_location=device)
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        if use_scaler and "scaler" in state:
+            scaler.load_state_dict(state["scaler"])
+        history = state["history"]
+        best_val_accuracy = state["best_val_accuracy"]
+        epochs_without_improvement = state["epochs_without_improvement"]
+        start_epoch = state["epoch"] + 1  # resume from the epoch *after* the last completed one
+        print(
+            f"[MedSentiX-{variant}] resuming from epoch {start_epoch + 1}/{epochs} "
+            f"(best_val_accuracy so far: {best_val_accuracy:.4f})",
+            flush=True,
+        )
+
+    for epoch in range(start_epoch, epochs):
         model.train()
-        losses: List[float] = []
+        loss_sum = torch.zeros((), device=device)  # stays on GPU — no per-step sync
+        batch_count = 0
         total_batches = len(train_loader)
+        verbose = running_on_kaggle()  # tqdm renders live locally; Kaggle's log export doesn't capture it
         log_every = max(1, total_batches // 10)  # ~10 plain-text checkpoints per epoch
         for step, batch in enumerate(tqdm(train_loader, desc=f"MedSentiX-{variant} epoch {epoch + 1}/{epochs}"), start=1):
             optimizer.zero_grad(set_to_none=True)
@@ -466,20 +501,24 @@ def train_medsentix_variant(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP)
                 optimizer.step()
             scheduler.step()
-            losses.append(float(loss.detach().cpu()))
-            # Plain print(), not tqdm's \r-based update — Kaggle's log
-            # viewer/exporter (especially in background/commit mode) doesn't
-            # reliably capture carriage-return overwrites, so without this a
-            # long run can look completely silent even while it's healthy.
-            if step % log_every == 0 or step == total_batches:
+            # Accumulate on-device — .detach() alone doesn't sync, only a
+            # .item()/.cpu()/float() call blocks on the GPU. Deferring that
+            # to just the periodic print (below) instead of every single
+            # step lets the next batch's kernels get queued immediately,
+            # which is what was causing the GPU utilization dips you saw.
+            loss_sum += loss.detach()
+            batch_count += 1
+            if verbose and (step % log_every == 0 or step == total_batches):
+                recent_avg = (loss_sum / batch_count).item()  # one sync per ~10% of epoch, not per step
                 print(
                     f"[MedSentiX-{variant}] epoch {epoch + 1}/{epochs} "
-                    f"step {step}/{total_batches} loss={float(np.mean(losses[-log_every:])):.4f}",
+                    f"step {step}/{total_batches} loss={recent_avg:.4f}",
                     flush=True,
                 )
 
+        epoch_train_loss = (loss_sum / max(batch_count, 1)).item()
         val_metrics, _, _, _ = evaluate_medsentix(model, val_loader, device)
-        history["train_loss"].append(float(np.mean(losses)))
+        history["train_loss"].append(epoch_train_loss)
         history["val_accuracy"].append(float(val_metrics["accuracy"]))
         print(
             f"[MedSentiX-{variant}] epoch {epoch + 1}/{epochs} done — "
@@ -492,10 +531,30 @@ def train_medsentix_variant(
             torch.save(model.state_dict(), checkpoint_path)
         else:
             epochs_without_improvement += 1
-            if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
-                print(f"[MedSentiX-{variant}] early stopping at epoch {epoch + 1} (patience={EARLY_STOPPING_PATIENCE})", flush=True)
-                break
 
+        # Saved every epoch regardless of improvement — this is the resume
+        # point, distinct from checkpoint_path (best weights only). Written
+        # after the improvement check above so best_val_accuracy/epochs_
+        # without_improvement in the saved state reflect this epoch's result.
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict() if use_scaler else None,
+                "history": history,
+                "best_val_accuracy": best_val_accuracy,
+                "epochs_without_improvement": epochs_without_improvement,
+                "epoch": epoch,
+            },
+            resume_path,
+        )
+
+        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+            print(f"[MedSentiX-{variant}] early stopping at epoch {epoch + 1} (patience={EARLY_STOPPING_PATIENCE})", flush=True)
+            break
+
+    resume_path.unlink(missing_ok=True)  # training finished — no longer needed for resume
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     metrics, y_true, y_pred, probabilities = evaluate_medsentix(model, test_loader, device)
     metrics["model"] = f"medsentix_{variant}"
@@ -812,7 +871,22 @@ def run_shap_analysis(
 
     masker = shap.maskers.Text(tokenizer)
     explainer = shap.Explainer(predict_proba, masker, output_names=[ID2LABEL[i] for i in range(NUM_CLASSES)])
-    shap_values = explainer(texts)
+    # max_evals="auto" (the default) computes a budget from the text's token
+    # clustering, which can resolve to None on short/edge-case inputs or
+    # certain shap+transformers version combos — that then fails downstream
+    # as "'<' not supported between instances of 'NoneType' and 'int'".
+    # Passing an explicit integer sidesteps the broken auto-calculation
+    # entirely. 500 is a lighter budget than the strict worst-case bound
+    # (2 * MAX_LEN + 1 = 1025) — coarser attribution on very long reviews,
+    # but SHAP figures here are illustrative, not exhaustive, so this
+    # trade favors speed. Bump back toward 1025 if attributions look noisy.
+    max_evals = 500
+    # SHAP evaluates many masked variants of each review through the model;
+    # a small batch_size (default 50) means small, frequent GPU calls with
+    # CPU-side mask generation in between — that's the actual cause of the
+    # ~65% utilization, not something wrong with your setup. Raising it lets
+    # more masked variants run through the model per call.
+    shap_values = explainer(texts, max_evals=max_evals, batch_size=128)
 
     shap.plots.bar(shap_values, max_display=20, show=False)
     plt.tight_layout()
