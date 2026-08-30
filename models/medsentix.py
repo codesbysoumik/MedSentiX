@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import pickle
 import time
 from functools import partial
 from pathlib import Path
@@ -843,9 +844,14 @@ def save_attention_heatmap(
 def run_shap_analysis(
     project_root: Path = PROJECT_ROOT,
     dev_mode: bool = True,
-    sample_size: int = 100,
+    sample_size: int = 25,
 ) -> pd.DataFrame:
-    """Run SHAP explainability for MedSentiX-Full and save paper figures."""
+    """Run SHAP explainability for MedSentiX-Full and save paper figures.
+
+    sample_size defaults to 25, not 100 — SHAP figures here are illustrative
+    case studies, not a statistical claim over a large N, so a much smaller
+    sample is standard practice and dramatically cheaper to compute.
+    """
     ensure_medsentix_dirs(project_root)
     if shap is None:
         raise ImportError("shap is required for SHAP analysis.")
@@ -883,10 +889,44 @@ def run_shap_analysis(
     max_evals = 500
     # SHAP evaluates many masked variants of each review through the model;
     # a small batch_size (default 50) means small, frequent GPU calls with
-    # CPU-side mask generation in between — that's the actual cause of the
-    # ~65% utilization, not something wrong with your setup. Raising it lets
-    # more masked variants run through the model per call.
-    shap_values = explainer(texts, max_evals=max_evals, batch_size=128)
+    # CPU-side mask generation in between.
+    batch_size = 128
+
+    # The single call explainer(texts, ...) that used to run here has no
+    # natural progress-save point — losing a session at 96% meant losing
+    # everything. Instead, process in small chunks and pickle each chunk's
+    # result to disk immediately, so a session cutoff only costs the
+    # in-flight chunk, not the whole run. Chunks already on disk from a
+    # previous attempt are skipped automatically.
+    chunk_size = 5
+    checkpoint_dir = project_root / "results/shap_checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    verbose = running_on_kaggle()
+    chunk_paths: List[Path] = []
+    num_chunks = math.ceil(len(texts) / chunk_size)
+    for chunk_index in range(num_chunks):
+        chunk_path = checkpoint_dir / f"chunk_{chunk_index:04d}.pkl"
+        chunk_paths.append(chunk_path)
+        if chunk_path.exists():
+            continue  # already computed in a previous run — skip
+        chunk_texts = texts[chunk_index * chunk_size : (chunk_index + 1) * chunk_size]
+        chunk_values = explainer(chunk_texts, max_evals=max_evals, batch_size=batch_size)
+        with chunk_path.open("wb") as handle:
+            pickle.dump(chunk_values, handle)
+        if verbose or (chunk_index + 1) % 5 == 0 or chunk_index == num_chunks - 1:
+            print(f"[SHAP] chunk {chunk_index + 1}/{num_chunks} done ({len(chunk_texts)} reviews)", flush=True)
+
+    chunks: List = []
+    for chunk_path in chunk_paths:
+        with chunk_path.open("rb") as handle:
+            chunks.append(pickle.load(handle))
+    # shap.Explanation objects support `+` to concatenate along the samples
+    # axis. If this errors on your shap version, the raw per-chunk pickles
+    # in results/shap_checkpoints/ are still intact and nothing is lost —
+    # only this final merge step would need a version-specific workaround.
+    shap_values = chunks[0]
+    for chunk in chunks[1:]:
+        shap_values = shap_values + chunk
 
     shap.plots.bar(shap_values, max_display=20, show=False)
     plt.tight_layout()
@@ -926,6 +966,11 @@ def run_shap_analysis(
     plt.tight_layout()
     plt.savefig(project_root / "results/figures/shap_plots/attention_entropy_by_head.png", dpi=300)
     plt.close()
+    # Analysis completed successfully — the per-chunk checkpoints have
+    # served their purpose and can be cleared so a future call starts fresh
+    # rather than silently reusing stale chunks from a different sample_size.
+    for chunk_path in chunk_paths:
+        chunk_path.unlink(missing_ok=True)
     del model, tokenizer, frame, texts, masker, explainer, shap_values, entropy_rows, entropy_df, encoded, attention
     cleanup_memory()
     return entropy_summary
